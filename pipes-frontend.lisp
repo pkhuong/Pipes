@@ -188,7 +188,7 @@
                        'function `(lambda ,args
                                     (,function ,@(nreverse expr-args))))))))
 
-(defunctor scan (function input initial-value &optional type)
+(defunctor scan (function input initial-value &optional (type t))
   (wrap-eval (list input) (input)
     (delay
       (make-instance 'scanl-node
