@@ -1,0 +1,3 @@
+A prototype fusion EDSL for Common Lisp
+
+Goal: provide most of SERIES, with less hair.
