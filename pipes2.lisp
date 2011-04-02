@@ -25,11 +25,13 @@
 #+debug
 (declaim (optimize (debug 2)))
 (defclass node-base ()
-  ((info :accessor info :documentation "Mutable slot for analyses")
+  ((info :accessor info :documentation "Mutable slot for analyses"
+         :initform nil)
    (hash :reader hash :initform (random (1+ most-positive-fixnum))
          :documentation "EQL hashes can have issues")
-   (output :reader output :initform 0
-           :documentation "Number of values to return; all if T.")))
+   (output :reader output :initform 0 :initarg output
+           :documentation "Number of values to return; all if T.")
+   (input-clock-domain :accessor input-clock-domain)))
 
 (defun node-eql (x y)
   (eql x y))
@@ -42,10 +44,13 @@
 ;; stream nodes are well-behaved: they produce exactly one output for
 ;; each input.
 (defclass stream-node (node-base) ())
+;; scan nodes are even better behaved: they never introduce skips.
+(defclass scan-node (stream-node) ())
 ;; arbitrary nodes aren't so nice: they produce an arbitrary number of
 ;; outputs for each input.
 (defclass node (node-base) ())
 
+(defclass clock (node) ())
 ;; sinks are special nodes: they can't have any use (output)
 (defclass sink (node) ())
 ;; sources are also special: they don't have any input,
@@ -74,6 +79,10 @@
   (:documentation "node -> sequence of input nodes")
   (:method ((node source))
     '()))
+(defgeneric (setf input-nodes) (inputs node)
+  (:method (inputs (node source))
+    (assert (null inputs))
+    inputs))
 (defgeneric input-names (node)
   (:documentation "node -> sequence of input names (symbols)")
   (:method ((node source))
@@ -83,7 +92,18 @@
 one value for each input.")
   (:method ((node stream-node))
     t)
-  (:method ((node node))
+  (:method ((node source))
+    t)
+  (:method ((node node-base))
+    nil))
+(defgeneric scanlyp (node)
+  (:documentation "returns T if node is scanly, producing exactly
+one value for each input, and never introducing skips.")
+  (:method ((node scan-node))
+    t)
+  (:method ((node source))
+    t)
+  (:method ((node node-base))
     nil))
 (defgeneric flushablep (node)
   (:method ((node sink))
@@ -133,6 +153,84 @@ might be the pattern you're looking for.
             :test
             `(null ,list))))
 
+(defclass iota-source (source)
+  ((type :accessor iota-type :initarg type :initform '(and unsigned-byte fixnum))
+   (max  :accessor iota-max  :initarg max  :initform most-positive-fixnum)
+   (max-var :reader max-var :initform (gensym "MAX"))
+   (idx-var :reader idx-var :initform (gensym "IDX"))))
+(defmethod expansion ((node iota-source) _ __)
+  (let ((idx (idx-var node))
+        (max (max-var node)))
+    (values `((,max ,(iota-max node))
+              (,idx 0))
+            `((type ,(iota-type node) ,idx ,max)
+              (close ,max))
+            (lambda (k)
+              `(progn
+                 ,k
+                 (incf ,idx)))
+            nil
+            idx
+            :test
+            `(>= ,idx ,max)
+            :output idx)))
+
+(defclass shared-iota-source (iota-source)
+  ((parent :reader parent :initarg parent)))
+(defmethod expansion ((node shared-iota-source) _ __)
+  (let ((max (max-var node)))
+    (values `((,max ,(iota-max node)))
+            `((type ,(iota-type node) ,max)
+              (close ,max)
+              (ignorable ,max))
+            'identity
+            nil
+            (idx-var (parent node))
+            :test nil
+            :inner-wrap
+            (lambda (k)
+              `(progn
+                 (setf ,(max-var (parent node))
+                       (min ,(max-var (parent node)) ,max))
+                 ,k))
+            :output (idx-var (parent node)))))
+(defmethod clock-domain ((node shared-iota-source))
+  (info (parent node)))
+
+#+nil
+(defclass count-node (scan-node single-input-node)
+  ((type :accessor count-type :initarg type      :initform '(and unsigned-byte fixnum))
+   (var  :reader    count-var :initarg count-var :initform (gensym "COUNT"))))
+#+nil
+(defmethod expansion ((node count-node) _ output)
+  (let ((var (count-var node)))
+    (values `((,var 0))
+            `((type ,(count-type node) ,var))
+            (lambda (k)
+              `(progn
+                 ,k
+                 (incf ,var)))
+            nil
+            var
+            :output var)))
+#+nil
+(defclass shared-count-node (scan-node nullary-node)
+  ((parent :reader parent :initarg parent)))
+#+nil
+(defmethod expansion ((node shared-count-node) _ output)
+  (let* ((parent (parent node))
+         (var    (etypecase parent
+                   (count-node (count-var parent))
+                   (iota-source (idx-var parent)))))
+    (values nil nil
+            'identity
+            nil
+            var
+            :output var)))
+#+nil
+(defmethod clock-domain ((node shared-count-node))
+  (info (parent node)))
+
 (defclass vector-source (source)
   ((vector :reader vector-source :initarg vector-source)
    (eltype :initarg eltype :initform '*)))
@@ -144,8 +242,7 @@ might be the pattern you're looking for.
     (values `((,vec ,(vector-source node))
               (,len (length ,vec))
               (,idx 0))
-            `(#+nil(type (simple-array ,(slot-value node 'eltype) 1) ,vec)
-                   (close ,vec ,len)
+            `((close ,vec ,len)
               (type (and unsigned-byte fixnum) ,idx))
             (lambda (k)
               `(let ((,value (aref ,vec ,idx)))
@@ -161,6 +258,10 @@ might be the pattern you're looking for.
 
 (defmethod input-nodes ((node single-input-node))
   (list (slot-value node 'input-node)))
+(defmethod (setf input-nodes) (inputs (node single-input-node))
+  (assert (typep inputs '(cons t null)))
+  (setf (slot-value node 'input-node) (first inputs))
+  inputs)
 (defmethod input-names ((node single-input-node))
   (list (slot-value node 'input-name)))
 
@@ -184,7 +285,74 @@ might be the pattern you're looking for.
                  :initarg :element-type
                  :initform 't)))
 
-(defmethod expansion ((node vector-sink) _ __) _
+(defun generate-flatten-push-vector (type)
+  `(lambda (stack last last-length)
+     (declare (type list stack)
+              (type (simple-array ,type 1) last)
+              (type (and unsigned-byte fixnum) last-length)
+              (optimize speed (safety 0)))
+     (setf stack (reverse stack))
+     (let* ((total-length (reduce #'+ stack
+                                  :key (lambda (x)
+                                         (length (truly-the (simple-array ,type 1) x)))
+                                  :initial-value last-length))
+            (output       (if (<= total-length (length last))
+                              (sb-kernel:%shrink-vector last total-length)
+                              (make-array total-length
+                                          :element-type (array-element-type last))))
+            (start        0))
+       (declare (type (mod #.most-positive-fixnum) total-length start)
+                (type (simple-array ,type 1) output))
+       (replace output last :start1 (- total-length last-length))
+       (map nil (lambda (vec)
+                  (let ((vec (truly-the (simple-array ,type 1) vec)))
+                    (replace output vec :start1 start)
+                    (incf start (length vec))))
+            stack)
+       output)))
+
+(defun flatten-push-vector (stack last last-length)
+  (declare (type (simple-array * 1) last))
+  (let ((table (load-time-value (make-hash-table :test #'eql)))
+        (type  (array-element-type last)))
+    (funcall (or (gethash type table)
+                 (setf (gethash type table)
+                       (compile nil (generate-flatten-push-vector type))))
+             stack last last-length)))
+
+(defmethod expansion ((node vector-sink) _ __)
+  (let ((vector (gensym "VECTOR"))
+        (stack  (gensym "STACK"))
+        (max    (gensym "MAX"))
+        (idx    (gensym "IDX"))
+        (input  (slot-value node 'input-name))
+        (eltype (element-type node)))
+    (values `((,vector (make-array 16
+                                   :element-type ',eltype))
+              (,stack  nil)
+              (,max    16)
+              (,idx    0))
+            `((type (simple-array ,eltype 1) ,vector)
+              (type (and unsigned-byte fixnum) ,max)
+              (type (mod #.most-positive-fixnum) ,idx))
+            (lambda (k)
+              (assert (null k))
+              `(unless (? ,input)
+                 (when (= ,max ,idx)
+                   (push ,vector ,stack)
+                   (setf ,max (* 2 ,max)
+                         ,vector (make-array ,max :element-type ',eltype)
+                         ,idx 0))
+                 (locally (declare (optimize
+                                    (sb-c::insert-array-bounds-checks 0)))
+                   (setf (aref ,vector ,idx) ($ ,input)))
+                 (incf ,idx)))
+            nil nil
+            :output
+            `(flatten-push-vector ,stack ,vector ,idx))))
+
+#+nil
+(defmethod expansion ((node vector-sink) _ __)
   (let ((vector (gensym "VECTOR"))
         (max    (gensym "MAX"))
         (idx    (gensym "IDX"))
@@ -192,8 +360,8 @@ might be the pattern you're looking for.
         (eltype (element-type node)))
     (values `((,vector (make-array 16
                                    :element-type ',eltype))
-              (,max     16)
-              (,idx     0))
+              (,max    16)
+              (,idx    0))
             `((type (simple-array ,eltype 1) ,vector)
               (type (and unsigned-byte fixnum) ,max)
               (type (mod #.most-positive-fixnum) ,idx))
@@ -202,21 +370,22 @@ might be the pattern you're looking for.
               `(unless (? ,input)
                  (when (= ,max ,idx)
                    (setf ,max (* 2 ,max)
-                         ,vector (replace (make-array ,max
-                                                      :element-type ',eltype)
-                                          ,vector))
-                   #+nil(setf ,*suspend-var* t))
+                         ,vector (replace (make-array ,max :element-type ',eltype)
+                                          ,vector)))
                  (locally (declare (optimize
                                     (sb-c::insert-array-bounds-checks 0)))
                    (setf (aref ,vector ,idx) ($ ,input)))
                  (incf ,idx)))
             nil nil
             :output
-            `(values (sb-kernel:%shrink-vector ,vector ,idx)))))
+            `(sb-kernel:%shrink-vector ,vector ,idx))))
 
 (defclass nullary-node (node-base) ())
 (defmethod input-nodes ((node nullary-node))
   '())
+(defmethod (setf input-nodes) (input-nodes (node nullary-node))
+  (assert (null input-nodes))
+  input-nodes)
 (defmethod input-names ((node nullary-node))
   '())
 
@@ -240,9 +409,9 @@ might be the pattern you're looking for.
             temp
             :test nil)))
 
-(defclass map-node (stream-node)
+(defclass map-node (scan-node)
   ((input-names :reader input-names :initarg input-names)
-   (input-nodes :reader input-nodes :initarg input-nodes)
+   (input-nodes :accessor input-nodes :initarg input-nodes)
    (function    :reader map-function :initarg function)))
 (defconstant +skip+ '+skip+)
 (defmethod expansion ((node map-node) count _)
@@ -274,7 +443,7 @@ might be the pattern you're looking for.
             `(eql ,value '+skip+)
             value)))))
 
-(defclass scanl-node (stream-node single-input-node)
+(defclass scanl-node (scan-node single-input-node)
   ((initial-value    :initarg initial-value)
    (accumulator-type :initarg accumulator-type :initform 't)
    (function         :initarg function)))
@@ -294,6 +463,23 @@ might be the pattern you're looking for.
             skip
             acc
             :output acc)))
+
+(defclass filter-node (stream-node)
+  ((input-names :reader   input-names :initarg input-names)
+   (input-nodes :accessor input-nodes :initarg input-nodes)))
+(defmethod expansion ((node filter-node) count __)
+  (assert (= 2 (length (input-names node))))
+  (destructuring-bind (predicate value) (input-names node)
+    (let ((skip (gensym "SKIP")))
+      (values nil nil
+              (lambda (k)
+                `(let ((,skip (or (? ,predicate)
+                                  (? ,value)
+                                  (not ($ ,predicate)))))
+                   ,k))
+              skip
+              `($ ,value)))))
+
 ;; Stuff
 (defun map-nodes (function nodes &optional type)
   (map type function nodes))
@@ -362,6 +548,7 @@ might be the pattern you're looking for.
                        (setf domain (info (first (input-nodes node)))))
                     (node))
                   (push node (gethash domain map))
+                  (setf (input-clock-domain node) domain)
                   (if (streamlyp node)
                       domain
                       node)))
@@ -372,6 +559,104 @@ might be the pattern you're looking for.
                nodes)
     (nreversef (gethash clock map))
     map))
+
+(defun merge-iotas (nodes)
+  (let ((domain-iotas (make-hash-table :test 'node-eql))
+        (replacements (make-hash-table :test 'node-eql)))
+    (flet ((replace-inputs (node)
+             (setf (input-nodes node)
+                   (mapcar (lambda (node)
+                             (gethash node replacements node))
+                           (input-nodes node)))
+             node))
+      (map-into nodes (lambda (node)
+                        (cond ((typep node 'iota-source)
+                               (let* ((domain (input-clock-domain node))
+                                      (parent (gethash domain domain-iotas)))
+                                 (cond (parent
+                                        (setf (iota-type parent)
+                                              `(and ,(iota-type parent)
+                                                    ,(iota-type node)))
+                                        (setf (gethash node replacements)
+                                              (make-instance 'shared-iota-source
+                                                             'parent parent
+                                                             'max  (iota-max node)
+                                                             'type (iota-type node)
+                                                             'output (output node))))
+                                       (t
+                                        (setf (gethash domain domain-iotas) node)))))
+                              (t
+                               (replace-inputs node))))
+                nodes))))
+
+(defun adjoin-transitive-child (node table)
+  (labels ((walk (parent)
+             (let ((key (cons node parent)))
+               (unless (gethash key table)
+                 (setf (gethash key table) t)
+                 (map nil #'walk (input-nodes parent))))))
+    (map nil #'walk (input-nodes node)))
+  table)
+
+(defun find-skip-root (node transitive-table)
+  (cond ((info node))
+        ((not (scanlyp node))
+         (setf (info node) node))
+        ((sourcep node)
+         (setf (info node) (input-clock-domain node)))
+        (t
+         (let* ((inputs (mapcar (lambda (node)
+                                  (find-skip-root node transitive-table))
+                                (input-nodes node)))
+                (parent (find-if (lambda (root)
+                                   (every (lambda (input)
+                                            (or (eql root input)
+                                                (gethash (cons input root)
+                                                         transitive-table)))
+                                          inputs))
+                                 inputs)))
+           (setf (info node) (or parent node))))))
+
+#+nil
+(defun merge-counts (nodes)
+  (set-info nodes)
+  (let ((children (reduce #'adjoin-transitive-child
+                          nodes
+                          :from-end t
+                          :initial-value (make-hash-table :test 'node-eql)))
+        (root-counts  (make-hash-table :test 'node-eql))
+        (replacements (make-hash-table :test 'node-eql)))
+    (flet ((replace-inputs (node)
+             (setf (input-nodes node)
+                   (mapcar (lambda (node)
+                             (gethash node replacements node))
+                           (input-nodes node)))
+             node))
+      (map-into nodes (lambda (node)
+                        (cond ((typep node 'count-node)
+                               (let* ((root   (find-skip-root node children))
+                                      (parent (gethash root root-counts)))
+                                 (format t "~A -> ~A~%" node root)
+                                 (cond (parent
+                                        (setf (count-type parent)
+                                              `(and ,(count-type node)
+                                                    ,(count-type parent)))
+                                        (setf (gethash node replacements)
+                                              (make-instance 'shared-count-node
+                                                             'parent parent
+                                                             'output (output node))))
+                                       ((typep root 'clock)
+                                        (let ((new-node (make-instance
+                                                         'iota-source
+                                                         'output (output node))))
+                                          (setf (gethash node replacements) new-node
+                                                (gethash node root-counts)  new-node)))
+                                       (t
+                                        (setf (gethash root root-counts)
+                                              (replace-inputs node))))))
+                              (t
+                               (replace-inputs node))))
+                nodes))))
 
 (defconstant +unbound+ '+unbound+)
 
@@ -572,9 +857,12 @@ might be the pattern you're looking for.
 (defun compile-nodes (nodes &optional environment)
   (assert (dag-ordered-p nodes))
   (let* ((uses  (annotate-uses nodes))
-         (clock (make-instance 'node))
+         (clock (make-instance 'clock))
          (domains (propagate-clock-domain nodes clock))
          (*suspend-var* (gensym "SUSPEND")))
+    (setf nodes (merge-iotas nodes))
+    (annotate-uses nodes)
+    (setf domains (propagate-clock-domain nodes clock))
     (annotate-with-expansion nodes uses)
     (let* ((outer-env-builder (environment-builder
                                nodes

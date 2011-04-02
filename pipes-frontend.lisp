@@ -1,3 +1,5 @@
+;; add once-only form.
+
 (defmacro define-define-macro (macro function variable)
   `(progn
      (defparameter ,variable (make-hash-table))
@@ -16,6 +18,19 @@
 (defparameter *destination* nil)
 (defparameter *scope* nil)
 (defparameter *graph* nil)
+(defparameter *bind-around* nil)
+(defparameter *declare-around* nil)
+
+(defun once-only (form &key (base "G") declares)
+  (let ((var (gensym base)))
+    (push `(,var ,form) *bind-around*)
+    (when declares
+      (setf *declare-around*
+            (nconc (mapcar (lambda (declare)
+                             (append declare (list var)))
+                           declares)
+                   *declare-around*)))
+    var))
 
 (defun find-var (name &key (scope *scope*) (default nil defaultp))
   (assert name)
@@ -58,7 +73,7 @@
   (or (null name)
       (string= name "_")))
 
-;; FIXME: copypasta
+;; FIXME: m-v destructuring for pipe vars
 (macrolet ((update-scope-with-binding (scope binding)
              `(destructuring-bind (name values-or-form
                                    &optional (form nil formp))
@@ -72,19 +87,44 @@
                                           (cons name values-or-form))))
                   (unless (ignorable-name name)
                     (push binding ,scope))))))
-  (defoperator let* ((&rest bindings) &body body)
-    (let ((*scope* *scope*))
-      (map nil (lambda (binding)
-                 (update-scope-with-binding *scope* binding))
-           bindings)
-      (expand-operator `(progn ,@body))))
+  (flet ((split-bindings (bindings)
+           "Destructures bindings for multiple values.
+            Considering to extend this to some sort of more
+            general pattern matching."
+           (let ((user-bindings '())
+                 (destructured  '()))
+             (loop
+               for binding in bindings
+               for (name . rest) = binding
+               do (if (atom name)
+                      (push binding user-bindings)
+                      (let ((gensym (gensym "VALUE")))
+                        (push `(,gensym ,@rest) user-bindings)
+                        (loop
+                          for name in name
+                          for count upfrom 0
+                          do (push `(,name (map nth-value ',count ,gensym))
+                                   destructured)))))
+             (values (nreverse user-bindings)
+                     (nreverse destructured)))))
+    (defoperator let* ((&rest bindings) &body body)
+      (multiple-value-bind (bindings aux) (split-bindings bindings)
+        (let ((*scope* *scope*))
+          (map nil (lambda (binding)
+                     (update-scope-with-binding *scope* binding))
+               bindings)
+          (map nil (lambda (binding)
+                     (update-scope-with-binding *scope* binding))
+               aux)
+          (expand-operator `(progn ,@body)))))
 
-  (defoperator let ((&rest bindings) &body body)
-    (let ((scope *scope*))
-      (map nil (lambda (binding)
-                 (update-scope-with-binding scope binding))
-           bindings)
-      (expand-operator `(progn ,@body) :scope scope))))
+    (defoperator let ((&rest bindings) &body body)
+      (multiple-value-bind (bindings aux) (split-bindings bindings)
+        (let ((scope *scope*))
+          (map nil (lambda (binding)
+                     (update-scope-with-binding scope binding))
+               bindings)
+          (expand-operator `(let* ,aux ,@body) :scope scope))))))
 
 (defoperator progn (&body body)
   (unless body
@@ -173,10 +213,22 @@
   (make-instance 'list-source
                  'list-source list))
 
+#+nil
 (defunctor from-vector (vector &optional (eltype '*))
   (make-instance 'vector-source
                  'vector-source vector
                  'eltype eltype))
+
+(defunctor from-vector (vector)
+  (let ((vector (once-only vector :base "VEC")))
+    `(map (lambda (i)
+            (aref ,vector i))
+          (iota (length ,vector)))))
+
+(defunctor iota (max &optional (type 'unsigned-byte))
+  (make-instance 'iota-source
+                 'max max
+                 'type type))
 
 (defunctor to-list (input)
   (wrap-eval (list input) (input)
@@ -186,11 +238,10 @@
 
 (defunctor to-vector (input &optional (type t))
   (wrap-eval (list input) (input)
-    `(%delay ,(lambda ()
-                (make-instance 'vector-sink
-                               'input-name input
-                               'input-node (find-var input)
-                               :element-type type)))))
+    (delay (make-instance 'vector-sink
+                          'input-name input
+                          'input-node (find-var input)
+                          :element-type type))))
 
 (defunctor finally (value)
   (make-instance 'finally 'form value))
@@ -198,11 +249,21 @@
 (defunctor constant (value)
   (make-instance 'constant 'form value))
 
+(defunctor remove-if-not (test value)
+  (wrap-eval (list test value) (test value)
+    (delay
+      (let ((names (list test value)))
+        (make-instance 'filter-node
+                       'input-names names
+                       'input-nodes (mapcar #'find-var names))))))
+
 (defun expand-pipe-expression (expression env)
   (let* ((*scope*       '())
          (tail          (list 'tail))
          (*destination* (cons nil tail))
-         (*graph*       '()))
+         (*graph*       '())
+         (*bind-around* '())
+         (*declare-around* '()))
     (expand-operator expression)
     (let ((graph (loop for ((name . dest) . node) in (nreverse *graph*)
                        do (setf (slot-value node 'output)
@@ -210,12 +271,16 @@
                                     t
                                     0))
                        collect node)))
-      (compile-nodes graph env))))
+      `(let* ,(nreverse *bind-around*)
+         (declare ,@(nreverse *declare-around*))
+         ,(compile-nodes graph env)))))
 
 (defun expand-pipe-binder (expression body env)
   (let* ((*scope*       '())
          (*destination* (cons nil nil))
-         (*graph*       '()))
+         (*graph*       '())
+         (*bind-around* '())
+         (*declare-around* '()))
     (expand-operator expression)
     (map nil (lambda (entry)
                (setf (info (cdr entry)) nil))
@@ -240,7 +305,9 @@
                                  :from-end t
                                  :initial-value '())))
       `(multiple-value-bind ,vars
-           ,(compile-nodes graph env)
+           (let* ,(nreverse *bind-around*)
+             (declare ,@(nreverse *declare-around*))
+             ,(compile-nodes graph env))
          (declare (ignore ,@(nreverse ignores)))
          ,@body))))
 
